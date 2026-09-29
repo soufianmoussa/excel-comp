@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.xlsx
+*.log
+*.png
+*.aux
+*.log
+*.out
+*.pdf
+*.tex
