@@ -4,17 +4,20 @@ import logging
 
 import streamlit as st
 
-from comparator import STATUSES, compare
-from excel_reader import WorkbookError, detect_header, detect_tables, open_workbook, read_table
-from exporter import SHEETS, export_excel
+import pandas as pd
+
+from excel_reader import WorkbookError, detect_header, discover_tables, open_workbook, read_table
+from exporter import SHEETS, export_quality
 from normalizer import FIELDS
+from quality_ui import configure, viewer, missing_people_view
+from quality_report import analyze, presentation_summary, errors_only_report
 
 
 st.set_page_config(page_title="Comparateur de fichiers Excel", page_icon="📊", layout="wide")
 # Do not forward exception contents or source values to application logs.
 logging.getLogger("openpyxl").setLevel(logging.ERROR)
 st.title("Comparateur de fichiers Excel")
-st.caption("Comparez automatiquement les informations entre deux fichiers Excel.")
+st.caption("Comparez les personnes et vérifiez la qualité de toutes les colonnes de vos fichiers Excel.")
 st.info("Vos fichiers sont traités localement en mémoire. Aucune donnée n’est envoyée à un service externe.")
 
 
@@ -26,46 +29,79 @@ def upload_table(label):
     data = uploaded.getvalue()
     digest = hashlib.sha256(data).hexdigest()
     st.success("✓ Fichier chargé")
-    workbook = None
     try:
-        workbook = open_workbook(data)
-        tables = detect_tables(workbook)
-        chosen = None
-        if len(tables) == 1:
-            chosen = tables[0]
-        elif tables:
-            sheet = st.selectbox("Plusieurs tableaux détectés : choisissez la feuille", [t.sheet for t in tables], key=f"sheet_{label}_{digest}")
-            chosen = next(t for t in tables if t.sheet == sheet)
-        else:
-            st.warning(f"Le tableau principal n’a pas pu être détecté dans le fichier {label}. Utilisez les options avancées.")
-        with st.expander("Options avancées"):
-            manual = st.checkbox("Choisir la feuille et la ligne des en-têtes", key=f"manual_{label}_{digest}")
-            if manual:
-                sheet = st.selectbox("Feuille", workbook.sheetnames, key=f"manual_sheet_{label}_{digest}")
-                row = st.number_input("Ligne des en-têtes (la première ligne vaut 1)", min_value=1, max_value=max(1, workbook[sheet].max_row), value=1, step=1, key=f"row_{label}_{digest}_{sheet}")
-                chosen = detect_header(workbook[sheet], int(row))
-                if not chosen.available:
-                    st.warning("Aucune colonne reconnue sur cette ligne. Vérifiez la feuille et la ligne choisies.")
-                    return None, None
-            st.caption("Les deux présentations sont reconnues : nom complet et RIB complet, ou nom/prénom et RIB séparés.")
-        if chosen is None:
+        cache_key = f"upload_cache_{label}"
+        cache = st.session_state.get(cache_key)
+        if cache is None or cache["digest"] != digest or cache.get("version") != "structure-v1":
+            workbook = open_workbook(data)
+            detected = discover_tables(workbook)
+            cache = {"version": "structure-v1", "digest": digest, "workbook": workbook, "detected": detected, "loaded": {}}
+            st.session_state[cache_key] = cache
+        workbook, detected = cache["workbook"], cache["detected"]
+        if not detected:
+            st.warning("Le fichier semble vide.")
             return None, None
-        table = read_table(workbook, chosen)
-        if not table.records:
+        defaults = pd.DataFrame([{"Analyser": True, "Feuille": t.sheet, "Ligne des en-têtes": t.header,
+                                  "Détection": t.detection} for t in detected])
+        with st.expander("Options avancées"):
+            st.caption("Toutes les feuilles non vides sont proposées. Vérifiez les en-têtes des feuilles inhabituelles. Vous pouvez corriger leur numéro de ligne ou exclure une feuille de référence.")
+            sheet_config = st.data_editor(defaults, hide_index=True, key=f"headers_{label}_{digest}",
+                disabled=["Feuille", "Détection"],
+                column_config={"Ligne des en-têtes": st.column_config.NumberColumn(min_value=1, step=1, required=True)})
+            st.caption("Correction facultative des zones : indiquez les lignes Excel de début et de fin. Toute correction nécessite de relancer l’analyse. DATA = données, HEADER = en-têtes, TITLE = titre, REPORT = report, TOTAL / SUBTOTAL / SUMMARY = synthèse, NOTES = notes, EMPTY = vide, UNKNOWN = incertain.")
+            zones = st.data_editor(pd.DataFrame(columns=["Feuille", "Début", "Fin", "Type"]),
+                key=f"zones_{label}_{digest}", num_rows="dynamic", hide_index=True,
+                column_config={"Feuille": st.column_config.SelectboxColumn(options=workbook.sheetnames, required=True),
+                    "Début": st.column_config.NumberColumn(min_value=1, step=1, required=True),
+                    "Fin": st.column_config.NumberColumn(min_value=1, step=1, required=True),
+                    "Type": st.column_config.SelectboxColumn(options=["DATA", "HEADER", "TITLE", "REPORT", "TOTAL", "SUBTOTAL", "SUMMARY", "NOTES", "EMPTY", "UNKNOWN"], required=True)})
+        overrides = {}
+        for zone in zones.to_dict("records"):
+            if any(pd.isna(value) or value == "" for value in zone.values()):
+                raise WorkbookError("Complétez la feuille, les deux lignes et le type de chaque correction de structure.")
+            sheet_name, start, end = zone["Feuille"], int(zone["Début"]), int(zone["Fin"])
+            if sheet_name not in workbook.sheetnames or start != float(zone["Début"]) or end != float(zone["Fin"]) or not 1 <= start <= end <= workbook[sheet_name].max_row:
+                raise WorkbookError("La plage de correction de structure est invalide.")
+            selected = overrides.setdefault(sheet_name, {})
+            if any(row in selected for row in range(start, end + 1)):
+                raise WorkbookError("Les corrections de structure ne doivent pas se chevaucher.")
+            selected.update({row: zone["Type"] for row in range(start, end + 1)})
+        config_key = sheet_config.to_json() + zones.to_json()
+        if config_key not in cache["loaded"]:
+            tables = []
+            for item in sheet_config.to_dict("records"):
+                if not item["Analyser"]:
+                    continue
+                row = int(item["Ligne des en-têtes"])
+                sheet = workbook[item["Feuille"]]
+                if not 1 <= row <= sheet.max_row:
+                    raise WorkbookError(f"La ligne des en-têtes n'existe pas dans la feuille {sheet.title}.")
+                table = detect_header(sheet, row)
+                table.detection = item["Détection"]
+                tables.append(read_table(workbook, table, overrides.get(table.sheet)))
+            # Cache only the current header selection, inside this private session.
+            cache["loaded"] = {config_key: tables}
+        tables = cache["loaded"][config_key]
+        populated = [t for t in tables if t.original_rows]
+        if not populated:
             st.warning("Le fichier semble vide : aucune ligne de données détectée.")
             return None, None
-        st.success(f"✓ Tableau détecté · {table.sheet} · en-têtes ligne {table.header}\n\n✓ {len(table.records)} lignes détectées")
-        uncertain = sum(bool(r.issues) for r in table.records)
-        if uncertain:
-            st.warning(f"{uncertain} ligne(s) contiennent des informations manquantes ou à vérifier. Le résultat précisera les champs concernés.")
-        return table, (digest, table.sheet, table.header, table.end_header)
+        preferred = sorted(populated, key=lambda t: (not bool(t.records), -len(t.available)))
+        chosen = preferred[0]
+        if len(preferred) > 1:
+            with st.expander("Feuille de rapprochement (facultatif)"):
+                selected = st.selectbox("Feuille à rapprocher avec l'autre fichier", [t.sheet for t in preferred], key=f"sheet_{label}_{digest}")
+            chosen = next(t for t in preferred if t.sheet == selected)
+        st.success(f"✓ Tableau détecté · {chosen.sheet} · en-têtes ligne {chosen.header}\n\n✓ {len(chosen.records)} lignes détectées")
+        st.caption(f"Analyse interne : {len(tables)} feuille(s), {sum(len(t.all_columns) for t in tables)} colonnes. Rapprochement des personnes sur la feuille choisie.")
+        if any("proposés" in t.detection for t in tables):
+            st.warning("Certaines feuilles ont des en-têtes proposés automatiquement : vérifiez-les dans Options avancées.")
+        st.session_state[f"tables_{label}"] = tables
+        return chosen, (digest, chosen.sheet, config_key)
     except WorkbookError as error:
         st.error(str(error))
     except Exception:
         st.error(f"Impossible de lire le fichier {label}. Vérifiez son contenu et réenregistrez-le au format .xlsx.")
-    finally:
-        if workbook is not None:
-            workbook.close()
     return None, None
 
 
@@ -75,37 +111,31 @@ with left:
 with right:
     table_b, key_b = upload_table("B")
 
-st.subheader("Données à comparer")
-fields = []
-for col, (field, title) in zip(st.columns(4), FIELDS.items()):
-    with col:
-        if st.checkbox(title, value=True, key=f"field_{field}"):
-            fields.append(field)
-st.caption("Les lignes sont rapprochées grâce aux identifiants sélectionnés ; le nom sert de recours. L’ordre des lignes n’a pas d’importance.")
-if not fields:
-    st.warning("Choisissez au moins un champ à comparer.")
-ready = table_a is not None and table_b is not None and bool(fields)
+fields = list(FIELDS)  # Internal record identifiers; every column is still audited.
+ready = table_a is not None and table_b is not None
+mapping, edited, parsed = None, {}, {}
 if ready:
-    for label, table in (("A", table_a), ("B", table_b)):
-        for field in fields:
-            if field not in table.available:
-                st.error(f"Impossible de trouver la colonne {FIELDS[field]} dans le fichier {label}. Vérifiez les en-têtes ou décochez ce champ.")
-                ready = False
+    config_id = hashlib.sha256(repr((key_a, key_b)).encode()).hexdigest()[:16]
+    mapping, edited, parsed, valid = configure(st.session_state["tables_A"], st.session_state["tables_B"], table_a, table_b, fields, config_id)
+    ready = ready and valid
 
-signature = (key_a, key_b, tuple(fields))
+signature = ("presence-v1", key_a, key_b, tuple(fields), None if mapping is None else mapping.to_json(),
+             tuple((label, frame.to_json()) for label, frame in edited.items()))
 if st.session_state.get("result_signature") != signature:
-    for key in ("results", "export", "result_signature"):
+    for key in ("results", "export", "result_signature", "report"):
         st.session_state.pop(key, None)
 
-if st.button("Comparer les fichiers", type="primary", use_container_width=True, disabled=not ready):
+if st.button("Analyser et comparer", type="primary", width="stretch", disabled=not ready):
     try:
         with st.spinner("Comparaison en cours…"):
-            results = compare(table_a.records, table_b.records, fields)
-            metadata = {"Feuille A": table_a.sheet, "En-têtes A": table_a.header,
-                        "Feuille B": table_b.sheet, "En-têtes B": table_b.header,
-                        "Champs comparés": ", ".join(FIELDS[f] for f in fields),
-                        "Périmètre": "Toutes les lignes A ; les lignes présentes uniquement dans B ne sont pas comptées."}
-            st.session_state["export"] = export_excel(results, metadata)
+            tables_a, tables_b = st.session_state["tables_A"], st.session_state["tables_B"]
+            report = analyze(tables_a, tables_b, table_a, table_b, fields, mapping, parsed["A"], parsed["B"])
+            report = errors_only_report(report)
+            report["visible_findings"], report["main_metrics"] = presentation_summary(report, tables_a, tables_b, table_a, table_b)
+            results = report["records"]
+            st.session_state["export"] = export_quality(report, st.session_state["upload_cache_A"]["workbook"],
+                st.session_state["upload_cache_B"]["workbook"], tables_a, tables_b, table_a, table_b, mapping, edited["A"], edited["B"])
+            st.session_state["report"] = report
             st.session_state["results"] = results
             st.session_state["result_signature"] = signature
     except Exception:
@@ -113,18 +143,25 @@ if st.button("Comparer les fichiers", type="primary", use_container_width=True, 
 
 if "results" in st.session_state:
     results = st.session_state["results"]
-    st.subheader("Résultat de la comparaison")
-    metrics = st.columns(6)
-    metrics[0].metric("Total analysé", len(results))
-    for col, status in zip(metrics[1:], STATUSES):
-        col.metric({"MATCH": "Correspondances", "MISSING_IN_B": "Absents du fichier B", "DIFFERENT": "Différences", "INCOMPLETE": "Données incomplètes", "DUPLICATE": "Doublons"}[status], int((results["Code statut"] == status).sum()))
-    st.caption("Une ligne de résultat par ligne du fichier A. Les lignes présentes uniquement dans B ne sont pas comptées. Les données incertaines restent à vérifier.")
-    tabs = st.tabs(["Tous", *SHEETS.values()])
-    for tab, status in zip(tabs, [None, *SHEETS]):
-        with tab:
-            frame = results if status is None else results.loc[results["Code statut"] == status]
-            if frame.empty:
-                st.info("Aucune ligne dans cette catégorie.")
-            else:
-                st.dataframe(frame.drop(columns="Code statut"), hide_index=True, use_container_width=True)
-    st.download_button("Télécharger le résultat Excel", data=st.session_state["export"], file_name="resultat_comparaison.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
+    report = st.session_state["report"]
+    st.subheader("Résultats")
+    for col, (label, value) in zip(st.columns(3), report["main_metrics"].items()):
+        col.metric(label, value)
+    st.caption("Seules les erreurs sont affichées et comptées. Les compteurs de lignes concernent les données individuelles des deux fichiers, répétitions comprises. Les titres, reports et totaux restent consultables. Une ligne peut contenir plusieurs erreurs ; l’absence d’erreur détectée ne garantit pas qu’un rapprochement a pu être effectué.")
+    missing_people_view(report, table_a, table_b)
+    viewer(report, st.session_state["tables_A"], st.session_state["tables_B"], table_a, table_b)
+    with st.expander("Détails de l’analyse"):
+        tabs = st.tabs(["Tous", *SHEETS.values()])
+        for tab, status in zip(tabs, [None, *SHEETS]):
+            with tab:
+                frame = results if status is None else results.loc[results["Code statut"] == status]
+                st.dataframe(frame.drop(columns="Code statut"), hide_index=True, width="stretch")
+        st.markdown("**Erreurs détaillées**")
+        st.dataframe(report["anomalies"], hide_index=True, width="stretch")
+        st.markdown("**Différences entre fichiers — valeurs et coordonnées**")
+        st.dataframe(report["differences"], hide_index=True, width="stretch")
+        st.markdown("**Colonnes sans correspondance**")
+        st.dataframe(report["unmatched"], hide_index=True, width="stretch")
+        st.dataframe(pd.DataFrame(report["stats"].items(), columns=["Indicateur", "Valeur"]), hide_index=True, width="stretch")
+    st.download_button("Télécharger le rapport Excel", data=st.session_state["export"], file_name="resultat_comparaison.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", width="stretch")
+    st.caption("Le rapport inclut les feuilles annotées, leurs coordonnées, les règles appliquées et les correspondances. Les formules sources sont conservées comme texte non exécutable ; vos fichiers d'origine restent intacts.")

@@ -1,5 +1,5 @@
 """Conservative matching by selected identifiers, independent of row order."""
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 import pandas as pd
 
@@ -8,7 +8,7 @@ from normalizer import FIELDS, normalize
 
 STATUSES = {
     "MATCH": "✓ Correspondance", "MISSING_IN_B": "✗ Absent",
-    "DIFFERENT": "⚠ Différence", "INCOMPLETE": "? Incomplet", "DUPLICATE": "⚠ Doublon",
+    "DIFFERENT": "⚠ Différence", "INCOMPLETE": "? Incomplet", "AMBIGUOUS": "? Correspondance ambiguë",
 }
 
 
@@ -33,8 +33,6 @@ def compare(records_a, records_b, fields):
         if not strong and "name" in fields and "name" not in record.issues and values["name"]:
             strong.update(indexes["name"].get(values["name"], set()))
         candidates.append(strong)
-    claims = Counter(j for matches in candidates for j in matches)
-    signatures = Counter(tuple(v[f] for f in fields) for v in aa if all(v.values()))
     rows = []
     for record, values, matches in zip(records_a, aa, candidates):
         b = records_b[next(iter(matches))] if len(matches) == 1 else None
@@ -42,10 +40,9 @@ def compare(records_a, records_b, fields):
         missing = [f for f in fields if not values[f] or f in record.issues or
                    (b is not None and (not bv[f] or f in b.issues))]
         different = [f for f in fields if b is not None and f not in missing and values[f] != bv[f]]
-        ambiguous = len(matches) > 1 or any(claims[j] > 1 for j in matches)
-        ambiguous |= all(values.values()) and signatures[tuple(values[f] for f in fields)] > 1
+        ambiguous = len(matches) > 1
         if ambiguous:
-            status = "DUPLICATE"
+            status = "AMBIGUOUS"
         elif missing:
             status = "INCOMPLETE"
         elif not matches:
@@ -63,7 +60,7 @@ def compare(records_a, records_b, fields):
                     elif not normalize(f, rec.values.get(f)):
                         details.append(f"Fichier {label}, {FIELDS[f]} : information manquante.")
         if ambiguous:
-            details.append("Plusieurs lignes possibles ou une même ligne B revendiquée par plusieurs lignes A. Vérification nécessaire.")
+            details.append("Plusieurs lignes B peuvent correspondre. Vérification nécessaire pour choisir la bonne personne.")
         elif not matches:
             details.append("Aucune correspondance trouvée avec les champs sélectionnés.")
         result = {"Code statut": status, "Statut": STATUSES[status], "Ligne A": record.row,
@@ -78,4 +75,9 @@ def compare(records_a, records_b, fields):
                     "⚠ Ambigu" if ambiguous else "— Absent" if b is None else
                     "✗ Différent" if f in different else "✓ Identique")
         rows.append(result)
-    return pd.DataFrame(rows)
+    columns = ["Code statut", "Statut", "Ligne A", "Lignes B", "Champs différents", "À vérifier", "Détails"]
+    for f in FIELDS:
+        columns.extend([f"{FIELDS[f]} fichier A", f"{FIELDS[f]} fichier B"])
+        if f in fields:
+            columns.append(f"Contrôle {FIELDS[f]}")
+    return pd.DataFrame(rows, columns=columns)

@@ -50,9 +50,9 @@ def test_missing_and_different():
 
 
 def test_duplicates_and_conflicting_identifiers():
-    assert statuses([rec()], [rec(), rec(3)]) == ["DUPLICATE"]
-    assert statuses([rec(), rec(3)], [rec()]) == ["DUPLICATE", "DUPLICATE"]
-    assert statuses([rec()], [rec(cin="OTHER"), rec(3, ddp="OTHER", rib="OTHER")]) == ["DUPLICATE"]
+    assert statuses([rec()], [rec(), rec(3)]) == ["AMBIGUOUS"]
+    assert statuses([rec(), rec(3)], [rec()]) == ["MATCH", "MATCH"]
+    assert statuses([rec()], [rec(cin="OTHER"), rec(3, ddp="OTHER", rib="OTHER")]) == ["AMBIGUOUS"]
 
 
 def test_missing_values_are_never_matching_keys():
@@ -127,7 +127,7 @@ def test_export_text_and_formula_safety():
     result = compare([rec(name="=1+1")], [rec(name="=1+1")], ["cin"])
     data = export_excel(result)
     w = load_workbook(BytesIO(data), data_only=False)
-    assert w.sheetnames == ["Résumé", "Correspondances", "Différences", "Absents", "Incomplets", "Doublons"]
+    assert w.sheetnames == ["Résumé", "Correspondances", "Différences", "Absents", "Incomplets", "Correspondances ambiguës"]
     cells = list(w["Correspondances"].iter_rows(min_row=2))[0]
     assert all(c.data_type != "f" for c in cells)
     assert any(c.value == RIB and c.data_type == "s" for c in cells)
@@ -156,10 +156,11 @@ def test_streamlit_workflow(monkeypatch):
     app.button[0].click().run()
     assert not app.exception
     assert app.session_state["results"]["Code statut"].tolist() == ["MATCH"]
-    assert len(app.tabs) == 6
+    assert len(app.tabs) == 8  # Two directional absence lists plus existing details.
     assert len(app.session_state["export"]) > 0
-    app.checkbox(key="field_cin").uncheck().run()
-    assert "results" not in app.session_state
+    assert len(app.metric) == 3
+    assert not any(str(c.key).startswith("field_") for c in app.checkbox)
+    assert app.button[0].label == "Analyser et comparer"
 
 
 def test_local_samples_structure_only():
@@ -173,5 +174,7 @@ def test_local_samples_structure_only():
         assert len(tables) == 1
         table = read_table(w, tables[0])
         assert table.available == {"name", "ddp", "cin", "rib"}
-        assert len(table.records) == 2
+        # Local examples can grow; synthetic fixtures assert exact record counts.
+        assert len(table.records) >= 2
+        assert len(table.rows) == len(table.records)
         w.close()
